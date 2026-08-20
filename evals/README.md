@@ -12,6 +12,7 @@
   | Conventionality             | [Jupyter Notebook](./conventionality_evaluator.ipynb)    | [Prompts](./prompts/conventionality/)             |
   | Purpose                     | [Jupyter Notebook](./purpose_evaluator.ipynb)            | [Prompts](./prompts/purpose/)                     |
   | Text complexity (combo)     | [Jupyter Notebook](./text_complexity_combo.ipynb)        |                                                   |
+  | Critical Thinking in Argumentative Writing (early access) | [Jupyter Notebook](./critical-thinking/argumentative-essay/example_notebook.ipynb) | [Prompts + config](./critical-thinking/argumentative-essay/) |
 
 ## Requirements
 
@@ -26,6 +27,7 @@ Next, set your API keys as environment variables in your shell session:
 ```shell
 export GOOGLE_API_KEY="..."
 export OPENAI_API_KEY="..."
+export ANTHROPIC_API_KEY="..."
 ```
 
 You can also add these environment variables to an `.env` file.

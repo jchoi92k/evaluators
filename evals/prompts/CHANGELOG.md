@@ -4,6 +4,13 @@ All notable changes to the evaluator prompt files will be documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- `critical-thinking/argumentative-essay/` — Critical Thinking in Argumentative Writing evaluator (early access): sha-pinned `system.txt` / `user.txt`, `config.json`, input/output schemas, fixtures, example notebook (Anthropic `claude-opus-5`, structured output).
+
+_Entry added by hand on the fork. If this evaluator is upstreamed via PR, release-please regenerates this section from the PR title and the hand entry should be dropped._
+
 ---
 ## [1.6.0](https://github.com/learning-commons-org/evaluators/compare/evals-prompts-v1.5.0...evals-prompts-v1.6.0) (2026-06-24)
 

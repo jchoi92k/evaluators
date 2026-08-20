@@ -46,6 +46,8 @@ If you’d like to download or access our evaluators and datasets directly, foll
 - Evaluators literacy package
   - [Prompts](./evals/prompts)
   - [Notebooks](./evals)
+- Critical thinking package (early access, this fork)
+  - [Critical Thinking in Argumentative Writing](./evals/critical-thinking/argumentative-essay/) — prompts, config, schemas, fixtures, notebook
 - Datasets
   - [Learning Commons annotations of CLEAR for qualitative text complexity v1.0 2025-09-02.csv](https://aidt-evaluators-files-public-prod.s3.us-west-2.amazonaws.com/Learning+Commons+annotations+of+CLEAR+for+qualitative+text+complexity+v1.0+2025-09-02.csv)
 

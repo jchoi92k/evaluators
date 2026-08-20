@@ -57,7 +57,7 @@
       },
       "model": {
         "provider": "anthropic",
-        "name": "claude-opus-5-20260723"
+        "name": "claude-opus-5"
       },
       "parser": {
         "kind": "structured_output"

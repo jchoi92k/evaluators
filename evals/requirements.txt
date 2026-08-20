@@ -2,6 +2,7 @@
 langchain
 langchain-google-genai
 langchain-openai
+langchain-anthropic
 textstat
 python-dotenv
 numpy
