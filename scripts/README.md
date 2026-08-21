@@ -36,10 +36,11 @@ fails the PR (it never auto-fixes) — so fixing locally saves a round-trip.
 | Check | What it does |
 |-------|--------------|
 | `strip-notebooks` | Clears outputs, execution counts, and cell metadata from `.ipynb` files |
-| `eval-config` | Validates each evaluator `config.json` against the shared schema (`evals/_schemas/config.schema.json`, referenced by the config's own `$schema`), plus cross-file rules: referenced files exist, prompt `sha256` matches, placeholders ⇄ template `{vars}` are in sync, system prompts carry no placeholders, and no obsolete `format_instructions` survive |
+| `eval-config` | Validates each evaluator `config.json` against the shared schema (`evals/_schemas/config.schema.json`, referenced by the config's own `$schema`), plus cross-file rules: referenced files exist, prompt `sha256` matches, placeholders ⇄ template `{vars}` are in sync, system prompts carry no placeholders, no obsolete `format_instructions` survive, and `stable_id`/`id`/`id_history` values are never reused across evaluators |
 | `eval-schemas` | Meta-validates each `input_schema.json` / `output_schema.json` is a well-formed JSON Schema document |
 | `eval-fixtures` | Validates `fixtures.json` against the shared `evals/_schemas/fixtures.schema.json`, and binds each case's `input`/`expected` to that evaluator's own input/output schema |
 | `eval-notebook` | Where an evaluator ships an example notebook, confirms it loads the config + prompt files from disk rather than hardcoding them |
+| `eval-requirements` | Cross-checks `evals/requirements.txt` against imports actually used in `evals/`, in both directions: something imported with no matching entry (a missing dependency), and something listed but never imported (a stale one) |
 
 ## Coming next
 
@@ -63,3 +64,21 @@ regardless. See [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 Add a `Check` subclass in `scripts/checks/` (see `strip_notebooks.py`) and
 register it in `scripts/checks/__init__.py`. It's automatically picked up by
 the orchestrator and CI.
+
+## `scripts/notebook_ci/` — live notebook execution (separate from the harness above)
+
+`find_affected.py` computes which evaluator notebooks a PR's changed files
+affect, by reading each evaluator's own `config.json` dependency closure
+(prompt `source_path`s, schema `$ref`s, `fixtures.path`) — not a hand-maintained
+map. Used by
+[`.github/workflows/eval-notebooks.yml`](../.github/workflows/eval-notebooks.yml)
+to run only the affected notebooks against real LLM APIs on each PR.
+
+This is intentionally **not** part of `scripts/check.py`: it makes real,
+billed API calls and is advisory (never blocks a PR), whereas the checks above
+are deterministic, free, and gate merges. Scope is also narrower — only
+evaluators with a `config.json` are covered, same as every check above.
+
+```bash
+python3 scripts/notebook_ci/find_affected.py --changed-files-from <(git diff --name-only main)
+```

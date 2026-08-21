@@ -4,7 +4,7 @@ import {
   Jurisdiction,
   type MathStandardsAlignmentEvaluatorConfig,
 } from '../../../../src/evaluators/math/standards-alignment.js';
-import { ConfigurationError, ValidationError, APIError } from '../../../../src/errors.js';
+import { ConfigurationError, ValidationError, APIError, KnowledgeGraphError, RateLimitError } from '../../../../src/errors.js';
 import type { LLMProvider } from '../../../../src/providers/base.js';
 import type { KnowledgeGraphClient } from '../../../../src/knowledge-graph/client.js';
 
@@ -110,6 +110,47 @@ describe('MathStandardsAlignmentEvaluator - constructor', () => {
 // evaluate
 // ---------------------------------------------------------------------------
 
+describe('MathStandardsAlignmentEvaluator - ambiguous statement codes', () => {
+  function makeLogger() {
+    return { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+  }
+
+  it('warns which standard was chosen when a code matches several', async () => {
+    const logger = makeLogger();
+    const repo = makeMockKgClient({
+      getLearningComponentsByCode: vi.fn().mockResolvedValue({
+        uuid: 'uuid-abc',
+        statementCode: STATEMENT_CODE,
+        normalizedCode: '3.MD.C.7.D',
+        description: 'Graph exponential functions',
+        ambiguous: true,
+        components: LC_COMPONENTS,
+      }),
+    });
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig({ _kgClient: repo, logger }));
+
+    await evaluator.evaluate(QUESTION, STATEMENT_CODE, JURISDICTION);
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    const [message, context] = logger.warn.mock.calls[0];
+    expect(message).toContain('matched multiple standards');
+    expect(context).toMatchObject({
+      statementCode: STATEMENT_CODE,
+      chosenUuid: 'uuid-abc',
+      chosenDescription: 'Graph exponential functions',
+    });
+  });
+
+  it('stays silent when the code resolves to one standard', async () => {
+    const logger = makeLogger();
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig({ logger }));
+
+    await evaluator.evaluate(QUESTION, STATEMENT_CODE, JURISDICTION);
+
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+});
+
 describe('MathStandardsAlignmentEvaluator - evaluate', () => {
   it('returns StandardAlignmentResult with correct shape on happy path', async () => {
     const evaluator = new MathStandardsAlignmentEvaluator(makeConfig());
@@ -134,7 +175,7 @@ describe('MathStandardsAlignmentEvaluator - evaluate', () => {
 
     expect(kgClient.getLearningComponentsByCode).toHaveBeenCalledWith(
       STATEMENT_CODE,
-      { jurisdiction: Jurisdiction.California, academicSubject: 'Mathematics', limit: 1 },
+      { jurisdiction: Jurisdiction.California, academicSubject: 'Mathematics' },
     );
   });
 
@@ -341,10 +382,65 @@ describe('MathStandardsAlignmentEvaluator - evaluateItems (shared codes)', () =>
     const filtered = results[0].standards.find((s) => s.statementCode === '3.OA.A.1')!;
     expect(filtered.coarseFiltered).toBe(true);
     expect(filtered.learningComponents).toHaveLength(0);
+    // Reported from the pre-fetch, so "skipped" is not confused with "has none".
+    expect(filtered.totalCount).toBe(2);
 
     const evaluated = results[0].standards.find((s) => s.statementCode === '3.MD.C.7.d')!;
     expect(evaluated.coarseFiltered).toBeUndefined();
     expect(evaluated.learningComponents).toHaveLength(2);
+  });
+
+  it('does not let the coarse filter drop an ambiguous code', async () => {
+    // The filter only sees one arbitrary candidate's description, so a sibling
+    // candidate could be the relevant one. Filtering it out would be a false negative.
+    const repo = makeMockKgClient({
+      getStandardInfo: vi.fn().mockResolvedValue({
+        uuid: 'uuid-abc',
+        statementCode: '3.OA.A.1',
+        normalizedCode: '3.OA.A.1',
+        description: 'an arbitrary sibling description',
+        ambiguous: true,
+      }),
+    });
+    vi.mocked(mockProvider.generateStructured)
+      .mockResolvedValueOnce({
+        data: { standards: [{ standard: '3.OA.A.1', relevant: false }] },
+        model: 'anthropic:claude-haiku-4-5-20251001', usage: { inputTokens: 50, outputTokens: 20 }, latencyMs: 200,
+      })
+      .mockResolvedValue(MOCK_BATCH_RESPONSE);
+
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig({ _kgClient: repo }));
+    const results = await evaluator.evaluateItems(
+      [{ question: QUESTION, statementCodes: ['3.OA.A.1'] }],
+      JURISDICTION,
+      { useCoarseFilter: true },
+    );
+
+    const result = results[0].standards[0];
+    expect(result.coarseFiltered).toBeUndefined();
+    expect(result.learningComponents).toHaveLength(2);
+  });
+
+  it('reports the known component count on an errored pair when the pre-fetch has it', async () => {
+    // Otherwise totalCount 0 would read as "this standard has no components".
+    vi.mocked(mockProvider.generateStructured)
+      .mockResolvedValueOnce({
+        data: { standards: [{ standard: STATEMENT_CODE, relevant: true }] },
+        model: 'anthropic:claude-haiku-4-5-20251001', usage: { inputTokens: 50, outputTokens: 20 }, latencyMs: 200,
+      })
+      .mockRejectedValue(new APIError('rate limited', 429));
+
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig());
+    const results = await evaluator.evaluateItems(
+      [{ question: QUESTION, statementCodes: [STATEMENT_CODE] }],
+      JURISDICTION,
+      { useCoarseFilter: true },
+    );
+
+    const errored = results[0].standards[0];
+    expect(errored.error?.message).toContain('rate limited');
+    expect(errored.alignedCount).toBe(0);
+    expect(errored.totalCount).toBe(2);
   });
 
   it('falls back to all standards relevant when coarse filter LLM throws', async () => {
@@ -423,10 +519,13 @@ describe('MathStandardsAlignmentEvaluator - evaluateByGrade', () => {
     await expect(evaluator.evaluateByGrade([QUESTION], '13', JURISDICTION)).rejects.toThrow(ValidationError);
   });
 
-  it('fetches standards for grade and jurisdiction and runs M×N evaluation', async () => {
+  it('fetches standards for grade and jurisdiction, deduping codes reused across courses', async () => {
+    // A jurisdiction reusing one code across courses returns an item per course.
+    // Without deduping, byStandard would repeat that code.
     const repo = makeMockKgClient({
       getStandardsByGrade: vi.fn().mockResolvedValue([
         { caseIdentifierUUID: 'u1', statementCode: '3.MD.C.7.d', description: 'Area', statementType: 'Standard', normalizedStatementType: 'Standard', gradeLevel: ['3'] },
+        { caseIdentifierUUID: 'u1b', statementCode: '3.MD.C.7.d', description: 'Area, other course', statementType: 'Standard', normalizedStatementType: 'Standard', gradeLevel: ['3'] },
         { caseIdentifierUUID: 'u2', statementCode: '3.OA.A.1', description: 'Products', statementType: 'Standard', normalizedStatementType: 'Standard', gradeLevel: ['3'] },
       ]),
     });
@@ -434,8 +533,28 @@ describe('MathStandardsAlignmentEvaluator - evaluateByGrade', () => {
     const result = await evaluator.evaluateByGrade([QUESTION], '3', JURISDICTION, { useCoarseFilter: false });
 
     expect(repo.getStandardsByGrade).toHaveBeenCalledWith('3', { jurisdiction: JURISDICTION, academicSubject: 'Mathematics' });
-    expect(result.byStandard).toHaveLength(2);
+    expect(result.byStandard.map((s) => s.statementCode)).toEqual(['3.MD.C.7.d', '3.OA.A.1']);
     expect(result.byQuestion[0].standards).toHaveLength(2);
+  });
+
+  it('warns when the grade-wide fan-out is large, and stays quiet when it is not', async () => {
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const manyStandards = Array.from({ length: 501 }, (_, i) => ({
+      caseIdentifierUUID: `u${i}`, statementCode: `3.XX.${i}`, description: 'd',
+      statementType: 'Standard', normalizedStatementType: 'Standard', gradeLevel: ['3'],
+    }));
+
+    const small = makeMockKgClient();
+    await new MathStandardsAlignmentEvaluator(makeConfig({ _kgClient: small, logger }))
+      .evaluateByGrade([QUESTION], '3', JURISDICTION, { useCoarseFilter: false });
+    expect(logger.warn).not.toHaveBeenCalled();
+
+    const large = makeMockKgClient({ getStandardsByGrade: vi.fn().mockResolvedValue(manyStandards) });
+    await new MathStandardsAlignmentEvaluator(makeConfig({ _kgClient: large, logger }))
+      .evaluateByGrade([QUESTION], '3', JURISDICTION, { useCoarseFilter: false });
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(logger.warn.mock.calls[0][1]).toMatchObject({ questions: 1, standards: 501, pairs: 501 });
   });
 
   it('returns byStandard with coverageCount counting questions with alignedCount > 0', async () => {
@@ -480,5 +599,274 @@ describe('MathStandardsAlignmentEvaluator - evaluateByGrade', () => {
     await evaluator.evaluateByGrade([QUESTION], '5', Jurisdiction.California);
 
     expect(repo.getStandardsByGrade).toHaveBeenCalledWith('5', { jurisdiction: Jurisdiction.California, academicSubject: 'Mathematics' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Error isolation
+// ---------------------------------------------------------------------------
+
+describe('MathStandardsAlignmentEvaluator - evaluateItems error isolation', () => {
+  function failingCodeClient(badCode: string): KnowledgeGraphClient {
+    return makeMockKgClient({
+      getLearningComponentsByCode: vi.fn().mockImplementation((code: string) =>
+        code === badCode
+          ? Promise.reject(new KnowledgeGraphError(`Standard not found: "${badCode}"`))
+          : Promise.resolve({ uuid: 'uuid-abc', description: 'Area additive', components: LC_COMPONENTS }),
+      ),
+    });
+  }
+
+  it('isolates a failing standard without discarding its siblings', async () => {
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig({ _kgClient: failingCodeClient('BAD.CODE') }));
+
+    const results = await evaluator.evaluateItems(
+      [{ question: QUESTION, statementCodes: [STATEMENT_CODE, 'BAD.CODE'] }],
+      JURISDICTION,
+    );
+
+    expect(results).toHaveLength(1);
+    const [good, bad] = results[0].standards;
+    expect(good.error).toBeUndefined();
+    expect(good.alignedCount).toBe(2);
+    expect(bad.error?.message).toContain('Standard not found');
+  });
+
+  it('attributes the error to the correct statementCode and carries a machine-readable code', async () => {
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig({ _kgClient: failingCodeClient('BAD.CODE') }));
+
+    const results = await evaluator.evaluateItems(
+      [{ question: QUESTION, statementCodes: [STATEMENT_CODE, 'BAD.CODE'] }],
+      JURISDICTION,
+    );
+
+    const errored = results[0].standards.filter((s) => s.error);
+    expect(errored).toHaveLength(1);
+    expect(errored[0].statementCode).toBe('BAD.CODE');
+    // A report needs to group failures by kind, not by message text.
+    expect(errored[0].error?.code).toBe('KNOWLEDGE_GRAPH_ERROR');
+    expect(errored[0].error?.name).toBe('KnowledgeGraphError');
+  });
+
+  it('carries statusCode and retryable through so a report can separate transient failures', async () => {
+    vi.mocked(mockProvider.generateStructured).mockRejectedValueOnce(new RateLimitError('slow down'));
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig());
+
+    const results = await evaluator.evaluateItems(
+      [{ question: QUESTION, statementCodes: [STATEMENT_CODE] }],
+      JURISDICTION,
+    );
+
+    expect(results[0].standards[0].error).toMatchObject({
+      name: 'RateLimitError',
+      code: 'RATE_LIMIT_ERROR',
+      statusCode: 429,
+      retryable: true,
+    });
+  });
+
+  it('does not discard other items when one item fails entirely', async () => {
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig({ _kgClient: failingCodeClient('BAD.CODE') }));
+
+    const results = await evaluator.evaluateItems(
+      [
+        { question: 'Q1', statementCodes: ['BAD.CODE'] },
+        { question: 'Q2', statementCodes: [STATEMENT_CODE] },
+      ],
+      JURISDICTION,
+    );
+
+    expect(results).toHaveLength(2);
+    expect(results[0].standards[0].error).toBeDefined();
+    expect(results[1].standards[0].error).toBeUndefined();
+    expect(results[1].standards[0].alignedCount).toBe(2);
+  });
+
+  it('surfaces an LLM failure as a per-pair error rather than rejecting', async () => {
+    vi.mocked(mockProvider.generateStructured).mockRejectedValueOnce(new APIError('rate limited', 429));
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig());
+
+    const results = await evaluator.evaluateItems(
+      [{ question: QUESTION, statementCodes: [STATEMENT_CODE] }],
+      JURISDICTION,
+    );
+
+    expect(results[0].standards[0].error?.message).toContain('rate limited');
+    expect(results[0].standards[0].alignedCount).toBe(0);
+  });
+
+  it('a throwing progress callback cannot corrupt results, counts, or the batch', async () => {
+    const logger = { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const onProgress = vi.fn(() => { throw new Error('progress bar blew up'); });
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig({ logger }));
+
+    const results = await evaluator.evaluateItems(
+      [{ question: QUESTION, statementCodes: [STATEMENT_CODE, 'OTHER.CODE'] }],
+      JURISDICTION,
+      { onProgress },
+    );
+
+    // Successful pairs stay successful, each pair is counted once, nothing rejects.
+    expect(results[0].standards.every((s) => s.error === undefined)).toBe(true);
+    expect(results[0].standards.every((s) => s.alignedCount === 2)).toBe(true);
+    expect(onProgress).toHaveBeenCalledTimes(2);
+    expect(onProgress).toHaveBeenLastCalledWith(2, 2);
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports progress for failed pairs too, so totals reconcile', async () => {
+    const repo = makeMockKgClient({
+      getLearningComponentsByCode: vi.fn().mockRejectedValue(new KnowledgeGraphError('nope')),
+    });
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig({ _kgClient: repo }));
+    const onProgress = vi.fn();
+
+    await evaluator.evaluateItems(
+      [{ question: QUESTION, statementCodes: [STATEMENT_CODE, 'OTHER.CODE'] }],
+      JURISDICTION,
+      { onProgress },
+    );
+
+    expect(onProgress).toHaveBeenCalledTimes(2);
+    expect(onProgress).toHaveBeenLastCalledWith(2, 2);
+  });
+
+  it('evaluate() still throws for a single pair', async () => {
+    const repo = makeMockKgClient({
+      getLearningComponentsByCode: vi.fn().mockRejectedValue(new KnowledgeGraphError('nope')),
+    });
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig({ _kgClient: repo }));
+    await expect(evaluator.evaluate(QUESTION, STATEMENT_CODE, JURISDICTION)).rejects.toThrow();
+  });
+
+  it('isolates a validation failure to the offending item', async () => {
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig());
+
+    const results = await evaluator.evaluateItems(
+      [
+        { question: '', statementCodes: [STATEMENT_CODE] },
+        { question: QUESTION, statementCodes: [STATEMENT_CODE] },
+      ],
+      JURISDICTION,
+    );
+
+    expect(results).toHaveLength(2);
+    expect(results[0].standards[0].error?.code).toBe('VALIDATION_ERROR');
+    // Same shape as every other failure, so grouping by name does not miss these.
+    expect(results[0].standards[0].error?.name).toBe('ValidationError');
+    expect(results[0].standards[0].statementCode).toBe(STATEMENT_CODE);
+    expect(results[1].standards[0].error).toBeUndefined();
+    expect(results[1].standards[0].alignedCount).toBe(2);
+  });
+
+  it('surfaces a validation failure even when the item has no statement codes', async () => {
+    // Nothing to map over, so without an item-level error the failure vanishes.
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig());
+
+    const results = await evaluator.evaluateItems(
+      [{ question: '', statementCodes: [] }],
+      JURISDICTION,
+    );
+
+    expect(results).toHaveLength(1);
+    expect(results[0].standards).toEqual([]);
+    expect(results[0].error).toMatchObject({ code: 'VALIDATION_ERROR', name: 'ValidationError' });
+  });
+
+  it('excludes an invalid item from the progress denominator', async () => {
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig());
+    const onProgress = vi.fn();
+
+    await evaluator.evaluateItems(
+      [
+        { question: '', statementCodes: [STATEMENT_CODE] },
+        { question: QUESTION, statementCodes: [STATEMENT_CODE] },
+      ],
+      JURISDICTION,
+      { onProgress },
+    );
+
+    expect(onProgress).toHaveBeenLastCalledWith(1, 1);
+  });
+
+  it('distinguishes zero coverage caused by errors from genuine non-alignment', async () => {
+    const repo = makeMockKgClient({
+      getLearningComponentsByCode: vi.fn().mockRejectedValue(new KnowledgeGraphError('nope')),
+    });
+    const errored = await new MathStandardsAlignmentEvaluator(makeConfig({ _kgClient: repo }))
+      .evaluateByGrade(['Q1'], '3', JURISDICTION);
+
+    expect(errored.byQuestion[0].standards[0].error).toBeDefined();
+    expect(errored.byStandard[0].coveredBy).toEqual([]);
+    expect(errored.byStandard[0]).toMatchObject({
+      coverageCount: 0, errorCount: 1, evaluatedCount: 0, noComponentsCount: 0,
+    });
+
+    // Same zero coverage, but measured: every LC came back unaligned.
+    vi.mocked(mockProvider.generateStructured).mockResolvedValue({
+      ...MOCK_BATCH_RESPONSE,
+      data: {
+        evaluations: MOCK_BATCH_RESPONSE.data.evaluations.map((e) => ({ ...e, answer: 'No' })),
+      },
+    });
+    const unaligned = await new MathStandardsAlignmentEvaluator(makeConfig())
+      .evaluateByGrade(['Q1'], '3', JURISDICTION);
+
+    expect(unaligned.byStandard[0]).toMatchObject({
+      coverageCount: 0, errorCount: 0, evaluatedCount: 1, noComponentsCount: 0,
+    });
+
+    // Third way to reach zero coverage: never evaluated because the filter skipped it.
+    vi.mocked(mockProvider.generateStructured).mockReset();
+    vi.mocked(mockProvider.generateStructured).mockResolvedValue({
+      data: { standards: [{ standard: STATEMENT_CODE, relevant: false }] },
+      model: 'anthropic:claude-haiku-4-5-20251001', usage: { inputTokens: 50, outputTokens: 20 }, latencyMs: 200,
+    });
+    const filtered = await new MathStandardsAlignmentEvaluator(makeConfig())
+      .evaluateByGrade(['Q1'], '3', JURISDICTION, { useCoarseFilter: true });
+
+    expect(filtered.byStandard[0]).toMatchObject({
+      coverageCount: 0, errorCount: 0, evaluatedCount: 0, filteredCount: 1,
+    });
+
+    // Fourth way: the standard exists but has no learning components, so nothing was
+    // measured. Counting it as evaluated would read as a judgement.
+    const noComponents = makeMockKgClient({
+      getLearningComponentsByCode: vi.fn().mockResolvedValue({ uuid: 'uuid-abc', components: [] }),
+    });
+    const unauthored = await new MathStandardsAlignmentEvaluator(makeConfig({ _kgClient: noComponents }))
+      .evaluateByGrade(['Q1'], '3', JURISDICTION);
+
+    // Its own counter, so all-zeros is never the only signal.
+    expect(unauthored.byStandard[0]).toMatchObject({
+      coverageCount: 0, errorCount: 0, evaluatedCount: 0, filteredCount: 0, noComponentsCount: 1,
+    });
+  });
+});
+
+describe('MathStandardsAlignmentEvaluator - shared concurrency', () => {
+  it('shares one LLM concurrency budget across concurrent evaluateItems calls', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    vi.mocked(mockProvider.generateStructured).mockImplementation(async () => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight--;
+      return MOCK_BATCH_RESPONSE;
+    });
+
+    const evaluator = new MathStandardsAlignmentEvaluator(makeConfig({ concurrency: 2 }));
+    const items = (prefix: string) =>
+      Array.from({ length: 4 }, (_, i) => ({ question: `${prefix}-${i}`, statementCodes: [STATEMENT_CODE] }));
+
+    await Promise.all([
+      evaluator.evaluateItems(items('A'), JURISDICTION),
+      evaluator.evaluateItems(items('B'), JURISDICTION),
+    ]);
+
+    // Exact: a per-call limiter would peak at 4, and "<= 2" alone would pass
+    // vacuously if everything serialized.
+    expect(peak).toBe(2);
   });
 });

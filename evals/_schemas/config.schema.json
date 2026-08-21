@@ -12,8 +12,19 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["id", "name", "description", "supported_grades"],
+      "dependentRequired": { "id_history": ["stable_id"] },
       "properties": {
         "id": { "type": "string", "minLength": 1 },
+        "stable_id": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+          "description": "Permanent UUID, assigned once and never changed, even when `id` changes because the evaluator moves between taxonomy groupings. Optional for now while this is backfilled evaluator-by-evaluator; will become required once every evaluator has one."
+        },
+        "id_history": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Every previous value of `id` for this `stable_id`, oldest first. Append the old `id` here whenever `id` changes -- this is what makes the id <-> stable_id mapping bidirectional and lookups possible in either direction."
+        },
         "name": { "type": "string", "minLength": 1 },
         "description": { "type": "string", "minLength": 1 },
         "supported_grades": {
@@ -65,7 +76,8 @@
           "endpoint": { "type": "string" },
           "params": { "type": "object" },
           "auth": { "type": "string" },
-          "pagination": { "type": "string" }
+          "pagination": { "type": "string" },
+          "condition": { "$ref": "#/$defs/Condition" }
         },
         "allOf": [
           {
@@ -148,7 +160,8 @@
             "properties": {
               "kind": { "const": "structured_output" }
             }
-          }
+          },
+          "condition": { "$ref": "#/$defs/Condition" }
         },
         "allOf": [
           {
@@ -164,6 +177,26 @@
       "properties": {
         "path": { "type": "string" },
         "tolerance": { "type": "object" }
+      }
+    }
+  },
+  "$defs": {
+    "Condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input", "in"],
+      "properties": {
+        "input": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Name of a runtime input field (as declared in input_schema.json) this condition tests."
+        },
+        "in": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": ["string", "number"] },
+          "description": "This step/preprocessing entry only applies when the named input's value is one of these."
+        }
       }
     }
   }
